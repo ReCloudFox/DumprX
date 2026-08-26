@@ -1,0 +1,126 @@
+name: ROM Dump
+
+on:
+  workflow_dispatch:
+    inputs:
+      firmware_url:
+        description: Firmware URL (Google Drive / MediaFire / Mega / direct link)
+        required: true
+        default: https://drive.google.com/file/d/12e6CIYy7E_oQC9erOEGNmzCOyF4Y2PgH/view?usp=drive_link
+      dump_dest:
+        description: GitHub username/org to push the dump to (blank = repo owner)
+        required: false
+        default: ''
+      firmware_password:
+        description: Archive password if firmware is encrypted (blank = none)
+        required: false
+        default: ''
+
+jobs:
+  dump:
+    name: Dump firmware partitions
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Maximize build disk space
+        run: |
+          echo 'Storage before cleanup:'
+          df -h /
+          sudo rm -rf \
+            /usr/share/dotnet \
+            /usr/local/lib/android \
+            /opt/ghc \
+            /usr/local/.ghcup \
+            /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force >/dev/null 2>&1 || true
+          sudo apt-get clean
+          rm -rf "${HOME}/.cache"
+          echo 'Storage after cleanup:'
+          df -h /
+
+      - name: Verify push credentials
+        env:
+          DUMPRX_TOKEN: ${{ secrets.DUMPRX_TOKEN }}
+        run: |
+          if [[ -z "${DUMPRX_TOKEN}" ]]; then
+            echo '::error::Secret DUMPRX_TOKEN is not set. Add a classic PAT with repo scope as a repository secret.'
+            exit 1
+          fi
+
+      - name: Setup DumprX
+        run: |
+          git clone --depth 1 "https://github.com/${GITHUB_REPOSITORY}.git" dumprx
+          cd dumprx
+          bash setup.sh
+
+      - name: Configure GitHub push credentials
+        working-directory: dumprx
+        env:
+          DUMPRX_TOKEN: ${{ secrets.DUMPRX_TOKEN }}
+          DUMP_DEST: ${{ inputs.dump_dest || github.repository_owner }}
+        run: |
+          printf '%s' "${DUMPRX_TOKEN}" > .github_token
+          printf '%s' "${DUMP_DEST}" > .github_orgname
+
+      - name: Configure git identity
+        env:
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          git config --global user.name "$OWNER"
+          git config --global user.email "$OWNER@users.noreply.github.com"
+
+      - name: Dump firmware
+        working-directory: dumprx
+        env:
+          FIRMWARE_URL: ${{ inputs.firmware_url }}
+          DUMPRX_ARCHIVE_PASSWORD: ${{ inputs.firmware_password }}
+        run: |
+          if [[ "${FIRMWARE_URL}" == *'drive.google.com'* ]]; then
+            python3 -m pip install --upgrade gdown \
+              || sudo python3 -m pip install --break-system-packages --upgrade gdown
+            mkdir -p input
+            if gdown "${FIRMWARE_URL}" -O input/; then
+              fw=$(find input -maxdepth 1 -type f -print -quit)
+              mv "${fw}" "input/firmware.${fw##*.}"
+              bash dumper.sh "input/firmware.${fw##*.}"
+            else
+              echo '::warning::gdown failed, falling back to DumprX built-in GDrive downloader'
+              bash dumper.sh "${FIRMWARE_URL}"
+            fi
+          else
+            bash dumper.sh "${FIRMWARE_URL}"
+          fi
+
+      - name: Debug super detection
+        if: failure()
+        working-directory: dumprx/out/tmp
+        run: |
+          B=../../utils/bin/7zz; command -v 7zz >/dev/null && B=7zz
+          echo "=== binaries ==="; ls -la ../../utils/bin/ | head; command -v 7z 7za unrar || true
+          echo '=== exact-path extract [E] ==='
+          "$B" e -y ../../input/firmware.rar 'STOK INOI U5 ID/super.img' -o. 2>&1 | tail -4
+          ls -la super.img 2>/dev/null || echo 'E failed'
+          rm -f super.img
+          echo '=== recursive extract [A] ==='
+          timeout 120 "$B" e -y -r ../../input/firmware.rar '*super.img' -o. 2>&1 | tail -3
+          ls -la super.img 2>/dev/null || echo 'A failed'
+          rm -f super.img
+          echo '=== system 7z if present [I] ==='
+          if command -v 7z >/dev/null; then
+            timeout 120 7z e -y ../../input/firmware.rar '*/super.img' -o. 2>&1 | tail -3
+            ls -la super.img 2>/dev/null || echo 'I failed'
+            rm -f super.img
+          fi
+          echo '=== extract-all health check [G] (capped) ==='
+          timeout 240 "$B" e -y ../../input/firmware.rar -oall 2>&1 | tail -3
+          find all -name 'super.img' -exec ls -la {} \; 2>/dev/null || echo 'G failed'
+
+      - name: Dump diagnostics
+        if: failure()
+        working-directory: dumprx
+        run: |
+          echo '=== input ==='; ls -la input/ 2>/dev/null || true
+          echo '=== out ==='; ls -la out/ 2>/dev/null | head -40 || true
+          echo '=== tmp ==='; ls -la out/tmp/ 2>/dev/null | head -40 || true
+          echo '=== zip.log tail ==='; tail -60 out/tmp/zip.log 2>/dev/null || true
